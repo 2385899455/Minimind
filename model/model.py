@@ -100,6 +100,7 @@ class RMSNorm(nn.Module):
         return self.weight * self._norm(x.float()).type_as(x) * x
 
 
+
 # end: 推断的长度
 # rope_base: 常取10000
 # rope_scaling: 缩放方法，Optional默认None, 也可传入dict 等价于dict | None
@@ -167,3 +168,4 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids = None, unsqueeze_dim = 1)
     q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
     k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
     return q_embed, k_embed
+
