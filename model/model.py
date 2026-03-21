@@ -1,7 +1,7 @@
 from transformers import PretrainedConfig
 import torch
 import torch.nn as nn
-from typing import Optional
+from typing import Optional, Tuple
 import math
 from torch.nn import functional as F
 
@@ -217,6 +217,7 @@ class Attention(nn.Module):
         # 输出 还原维度
         self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias = False)
         
+        # 注意力内部attention dropout
         self.dropout = nn.Dropout(args.dropout)
         # 残差网络
         self.resid_dropout = nn.Dropout(args.dropout)
@@ -229,6 +230,8 @@ class Attention(nn.Module):
     
 
     def forward(self, x:torch.Tensor, position_embedding:Tuple[torch.Tensor, torch.Tensor], past_key_value:Optional[Tuple[torch.Tensor, torch.Tensor]] = None, use_cache = False, attention_mask:Optional[torch.Tensor]=None) -> torch.Tensor:
+        # attention_mask: [bsz, seq_len] 1表示可以注意 0表示不能注意 用于处理padding部分
+        
         # 投影，计算出QKV
         bsz, seq_len, _ = x.size()
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
@@ -243,6 +246,7 @@ class Attention(nn.Module):
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
 
         # 对于K和V使用repeat (注意kv cache)
+        # 拼接是在 seq_len 维度操作的，而广播是在 heads 维度操作的
         if past_key_value is not None:
             torch.cat([past_key_value[0], xk], dim = 1)
             torch.cat([past_key_value[1], xv], dim = 1)
@@ -263,22 +267,26 @@ class Attention(nn.Module):
             # 训练模式 or 推理模式
             output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask, dropout_p = self.dropout.p if self.training else 0.0, is_causal = True)
         else:
+            # 这个是后两个维度的矩阵乘法，得到每个头的注意力分数 维度为 [bsz, n_local_heads, seq_len, seq_len]
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
             # 注意力掩码
             # 对角线以下变成负无穷 这样经过softmax后就变成0了
+            # 维度变为 [1, 1, seq_len, seq_len]才能和scores广播相加
             scores = scores + torch.tril((torch.full((seq_len, seq_len), float("-inf"), device = scores.device)), diagonal = 1).unsqueeze(0).unsqueeze(0)
 
             if attention_mask is not None:
+                # [bsz, 1, 1, seq_len]
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                # padding部分变成负无穷 这样经过softmax后就变成0了
                 scores = scores + extended_attention_mask
         
             scores = F.softmax(scores.float(), dim = -1).type_as(scores)
             scores = self.attn_dropout(scores)
             output = scores @ xv
 
-    # 最后拼接头，输出投影，返回
-    output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
-    output = self.resid_dropout(self.o_proj(output))
-    return output, past_kv
+        # 最后拼接头，输出投影，返回
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self.resid_dropout(self.o_proj(output))
+        return output, past_kv
 
