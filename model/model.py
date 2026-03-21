@@ -4,6 +4,8 @@ import torch.nn as nn
 from typing import Optional, Tuple
 import math
 from torch.nn import functional as F
+from transformers.activations import ACT2FN
+
 
 
 
@@ -19,7 +21,7 @@ class MokioMindConfig(PretrainedConfig):
         eos_token_id: int = 2,
         hidden_act: str = "silu",
         hidden_size: int = 512, # d_model维度 被隐藏
-        intermediate_size: int | None = None,
+        intermediate_size: int | None = None, # FFN中 升维的维度
         max_position_embeddings: int = 32768,
         num_attention_heads: int = 8, # Q的头数量 K和V的头数量由num_key_value_heads控制
         num_hidden_layers: int = 8,
@@ -290,3 +292,28 @@ class Attention(nn.Module):
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
 
+
+class FeedForward(nn.Module):
+    # 初始化
+    # 升维
+    # 降维
+    # 门控
+    # dropout
+    # 激活函数
+    def __init__(self, args:MokioMindConfig):
+        super().__init__()
+        
+        if args.intermediate_size is None:
+            intermediate_size = int(args.hidden_size * 8 / 3)
+            # 向上取整成64的倍数
+            args.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+            
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias = False) # 升维
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias = False) # 降维
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias = False) # 门控
+        self.dropout = nn.Dropout(args.dropout) # dropout
+        self.act_fn = ACT2FN[args.hidden_act]
+         
+    # SwiGLU
+    def forward(self, x):
+        return self.dropout(self.down_proj(self.act_fn(self.up_proj(x)) * self.gate_proj(x)))
