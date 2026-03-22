@@ -83,7 +83,7 @@ class MokioMindConfig(PretrainedConfig):
 
 
 
-
+# 归一化
 # 继承nn.Module类
 class RMSNorm(nn.Module):
     # __init__初始化
@@ -176,7 +176,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids = None, unsqueeze_dim = 1)
     return q_embed, k_embed
 
 
-
+# GQA
 # 一个token分成一个QKV, Q获得的头更多一些, K和V获得的头更少一些
 # 把较少的 K/V 头复制扩展到和 Q 头数量一致，方便做注意力计算 需要维度复制不只是数字变换
 def repeat_kv(x:torch.Tensor, n_rep:int) -> torch.Tensor:
@@ -194,7 +194,7 @@ def repeat_kv(x:torch.Tensor, n_rep:int) -> torch.Tensor:
             .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
             .reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
 
-
+# GQA
 class Attention(nn.Module):
     def __init__(self, args:MokioMindConfig):
         super().__init__()
@@ -292,7 +292,7 @@ class Attention(nn.Module):
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
 
-
+# FFN
 class FeedForward(nn.Module):
     # 初始化
     # 升维
@@ -317,3 +317,126 @@ class FeedForward(nn.Module):
     # SwiGLU
     def forward(self, x):
         return self.dropout(self.down_proj(self.act_fn(self.up_proj(x)) * self.gate_proj(x)))
+    
+    
+class MokioMindBlock(nn.Module):
+    def __init__(self, layer_id:int, config:MokioMindConfig):
+        super().__init__()
+        
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head.dim = self.hidden_size // self.num_attention_heads
+        self.self_attn = Attention(config)
+        
+        self.layer_id = layer_id
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = FeedForward(config)
+        
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        # 原本的hidden_states传过来 -> 用Attention -> 残差处理 -> FFN -> 残差处理
+        
+        residual = hidden_states
+        # Attention层用到的参数
+        hidden_states, present_key_value = self.self_attn(
+            self.input_layernorm(hidden_states), position_embeddings, past_key_value, use_cache, attention_mask
+        )
+        # Attention后残差处理
+        hidden_states = residual + hidden_states
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        return hidden_states, present_key_value
+    
+
+# 组装Model
+class MokioMindModel(nn.Module):
+    def __init__(self, config:MokioMindConfig):
+        super().__init__()
+        
+        # 词表大小 层数
+        self.vocab_size, self.num_hidden_layers = (
+            config.vocab_size,
+            config.num_hidden_layers
+        )
+        
+        # 将每个token转化为向量
+        # hidden_size固定后后续使用embed_tokens只需要传入vocab_size
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        
+        self.droppout = nn.Dropout(config.dropout)
+        
+        # Transformer Block堆叠层数
+        self.layers = nn.ModuleList(
+            [MokioMindBlock(i, config) for i in range(self.num_hidden_layers)]
+        )
+        
+        self.norm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
+        
+        # RoPE预计算
+        freq_cos, freq_sin = precompute_freqs_cis(
+            dim = config.hidden_size // config.num_attention_heads,
+            end = config.max_position_embeddings,
+            rope_base = config.rope_theta,
+            rope_scaling = config.rope_scaling            
+        )
+        
+        # 不会随模型更新 但会加载
+        self.register_buffer("freq_cos", freq_cos, persistent=False)
+        self.register_buffer("freq_sin", freq_sin, persistent=False)
+        
+    def forward(
+        self,
+        input_ids:Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        use_cache: bool = False,
+        **kwargs,
+    ):
+        # 最早的输入 只有[B, S]
+        batch_size, seq_len = input_ids.shape
+        
+        # 检查是否有属性 不用管
+        if hasattr(past_key_values, "layers"):
+            past_key_value = None
+            
+        
+        past_key_values = past_key_values or [None] * len(self.layers)
+        
+        # past_key_value[0] 是K
+        # past_key_value[0].shape[1] 是RoPE的起始位置
+        start_pos = (
+            past_key_values[0].shape[1] if past_key_values[0] is not None else 0
+        )
+        
+        # Embedding后进行归一化
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+        
+        # 保证 RoPE 位置连续（第 101 个 token 用第 101 个位置，而不是又从 0 开始）
+        position_embedding = (
+            self.freq_cos[start_pos:start_pos+seq_len],
+            self.freq_sin[start_pos:start_pos+seq_len],
+        )
+        
+        # kv cache的缓存
+        presents = []
+        
+        # 逐层跑 Transformer
+        for layer_ids, (layer, past_key_values) in enumerate(
+            zip(self.layers, past_key_values)
+        ): 
+            hidden_states, present = layer(
+                hidden_states,
+                position_embedding,
+                past_key_value = past_key_values,
+                use_cache = use_cache,
+                attention_mask = attention_mask,
+            )
+        
+            presents.append(present)
+        
+    
+        hidden_states = self.norm(hidden_states)
+        
+        return hidden_states, presents
+    
+    
+        
