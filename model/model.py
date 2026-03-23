@@ -6,7 +6,8 @@ import math
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin
-
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from typing import Union
 
 
 
@@ -126,6 +127,7 @@ def precompute_freqs_cis(dim:int, end:int = 32*1024, rope_base:int = 10000, rope
             rope_scaling["beta_slow"],
         )
 
+    # YaRN
     # 推断的长度大于训练长度，使用缩放
     if rope_scaling is not None and end > orig_max:
         # 波长b到i的映射 输入b的值通过计算得到inv_dim
@@ -460,6 +462,37 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         
         # 权重共享
         # 输出层的权重和嵌入层的权重共享
-        self.model.embed_tokens.weight = 
+        # embedding前后权重相同 d_model的权重和vocab_size的权重一致
+        self.model.embed_tokens.weight = self.lm_head.weight
         
+        self.OUT = CausalLMOutputWithPast()
+        
+    def forward(self, input_ids:Optional[torch.Tensor] = None,
+                attention_mask:Optional[torch.Tensor] = None,
+                past_key_values:Optional[Tuple[Tuple[torch.Tensor]]] = None,
+                use_cache:bool = False,
+                logits_to_keep:Union[int, torch.Tensor] = 0,
+                **args):
+        hidden_states, past_key_values = self.model(
+            input_ids = input_ids,
+            attention_mask = attention_mask,
+            past_key_values = past_key_values,
+            use_cache = use_cache,
+            **args,
+        )
+        
+        # logits_to_keep是整数就保留最后n个位置
+        # 生成时只需要最后的logits来预测下一个token
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        
+        self.OUT.__setitem__("last_hidden_state", hidden_states)
+        self.OUT.__setitem__("logits", logits)
+        self.OUT.__setitem__("past_key_values", past_key_values)
+        
+        return self.OUT
         
