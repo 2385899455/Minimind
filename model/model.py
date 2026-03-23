@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 import math
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
-
+from transformers import PreTrainedModel, GenerationMixin
 
 
 
@@ -438,5 +438,28 @@ class MokioMindModel(nn.Module):
         
         return hidden_states, presents
     
+
+# 往上上传的模型都要继承这两个类
+# PreTrainedModel提供“模型基类能力”
+# GenerationMixin提供“文本生成能力”
+class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MokioMindConfig
     
+    def __init__(self, config: MokioMindConfig):
+        self.config = config
+        
+        # 需要自己定义的config信息 所以要在自己的__init__之后
+        super().__init__(config)
+        
+        self.model = MokioMindModel(config)
+        
+        # 隐藏层映射回词表 表示每个词的概率
+        self.lm_head = nn.Linear(
+            self.config.hidden_size, self.vocab_size, bias=False
+        )
+        
+        # 权重共享
+        # 输出层的权重和嵌入层的权重共享
+        self.model.embed_tokens.weight = 
+        
         
