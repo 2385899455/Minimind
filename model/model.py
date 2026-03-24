@@ -1,13 +1,12 @@
 from transformers import PretrainedConfig
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 import math
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from typing import Union
 
 
 
@@ -100,11 +99,11 @@ class RMSNorm(nn.Module):
 
     # _norm
     def _norm(self, x):
-        return torch.rsqrt(x.pow(2).mean(-1, keepdim = True) + self.eps) 
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim = True) + self.eps) 
     
     # nn.Module要求必须写forward
     def forward(self, x):
-        return self.weight * self._norm(x.float()).type_as(x) * x
+        return self.weight * self._norm(x.float()).type_as(x)
 
 
 
@@ -134,7 +133,7 @@ def precompute_freqs_cis(dim:int, end:int = 32*1024, rope_base:int = 10000, rope
         inv_dim = lambda b:(dim*math.log(orig_max/(b*2*math.pi)))/(2*math.log(rope_base))
         
         # 划分高低维度
-        # low低维: 不许要缩放的高频部分
+        # low低维: 不需要缩放的高频部分
         # high高维: 需要缩放的低频部分
         low, high = (max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), dim//2 - 1))
 
@@ -202,13 +201,16 @@ class Attention(nn.Module):
         super().__init__()
 
         # 如果传入了num_key_value_heads就用传入的 否则默认和num_attention_heads一样
-        self.num_key_value_heads = args.num_key_value_heads if args.num_key_value_heads is not None else args.num_attention_heads
+        self.num_key_value_heads = (
+            args.num_attention_heads 
+            if args.num_key_value_heads is None 
+            else args.num_key_value_heads
+            )
 
         # 要确保Q是K/V头数量的整数倍
         assert args.num_attention_heads % self.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
 
         self.n_local_heads = args.num_attention_heads # 当前使用的头的数量
-        self.n_kv_heads = self.num_key_value_heads # K和V的头数量
         self.n_rep = self.n_local_heads // self.n_kv_heads # K/V头复制的次数
         self.head_dim = args.hidden_size // args.num_attention_heads # 每个头的维度 
 
@@ -233,7 +235,7 @@ class Attention(nn.Module):
     
     
 
-    def forward(self, x:torch.Tensor, position_embedding:Tuple[torch.Tensor, torch.Tensor], past_key_value:Optional[Tuple[torch.Tensor, torch.Tensor]] = None, use_cache = False, attention_mask:Optional[torch.Tensor]=None) -> torch.Tensor:
+    def forward(self, x:torch.Tensor, position_embeddings:Tuple[torch.Tensor, torch.Tensor], past_key_value:Optional[Tuple[torch.Tensor, torch.Tensor]] = None, use_cache = False, attention_mask:Optional[torch.Tensor]=None) -> torch.Tensor:
         # attention_mask: [bsz, seq_len] 1表示可以注意 0表示不能注意 用于处理padding部分
         
         # 投影，计算出QKV
@@ -246,11 +248,12 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
 
         # 对于Q和K使用RoPE
-        cos, sin = position_embedding
+        cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
 
         # 对于K和V使用repeat (注意kv cache)
         # 拼接是在 seq_len 维度操作的，而广播是在 heads 维度操作的
+        # 拼接的意义是当前 Q 可以看到历史所有 token
         if past_key_value is not None:
             torch.cat([past_key_value[0], xk], dim = 1)
             torch.cat([past_key_value[1], xv], dim = 1)
@@ -354,6 +357,8 @@ class MokioMindModel(nn.Module):
     def __init__(self, config:MokioMindConfig):
         super().__init__()
         
+        self.config = config
+        
         # 词表大小 层数
         self.vocab_size, self.num_hidden_layers = (
             config.vocab_size,
@@ -364,7 +369,7 @@ class MokioMindModel(nn.Module):
         # hidden_size固定后后续使用embed_tokens只需要传入vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         
-        self.droppout = nn.Dropout(config.dropout)
+        self.dropout = nn.Dropout(config.dropout)
         
         # Transformer Block堆叠层数
         self.layers = nn.ModuleList(
@@ -413,7 +418,7 @@ class MokioMindModel(nn.Module):
         hidden_states = self.dropout(self.embed_tokens(input_ids))
         
         # 保证 RoPE 位置连续（第 101 个 token 用第 101 个位置，而不是又从 0 开始）
-        position_embedding = (
+        position_embeddings = (
             self.freq_cos[start_pos:start_pos+seq_len],
             self.freq_sin[start_pos:start_pos+seq_len],
         )
@@ -422,13 +427,13 @@ class MokioMindModel(nn.Module):
         presents = []
         
         # 逐层跑 Transformer
-        for layer_ids, (layer, past_key_values) in enumerate(
+        for layer_ids, (layer, past_key_value) in enumerate(
             zip(self.layers, past_key_values)
         ): 
             hidden_states, present = layer(
                 hidden_states,
-                position_embedding,
-                past_key_value = past_key_values,
+                position_embeddings,
+                past_key_value = past_key_value,
                 use_cache = use_cache,
                 attention_mask = attention_mask,
             )
@@ -465,7 +470,7 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         # embedding前后权重相同 d_model的权重和vocab_size的权重一致
         self.model.embed_tokens.weight = self.lm_head.weight
         
-        self.OUT = CausalLMOutputWithPast()
+
         
     def forward(self, input_ids:Optional[torch.Tensor] = None,
                 attention_mask:Optional[torch.Tensor] = None,
@@ -490,9 +495,9 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         )
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         
-        self.OUT.__setitem__("last_hidden_state", hidden_states)
-        self.OUT.__setitem__("logits", logits)
-        self.OUT.__setitem__("past_key_values", past_key_values)
-        
-        return self.OUT
+        return CausalLMOutputWithPast(
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+        )
         
