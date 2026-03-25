@@ -211,7 +211,7 @@ class Attention(nn.Module):
         assert args.num_attention_heads % self.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
 
         self.n_local_heads = args.num_attention_heads # 当前使用的头的数量
-        self.n_rep = self.n_local_heads // self.n_kv_heads # K/V头复制的次数
+        self.n_rep = self.n_local_heads // self.num_key_value_heads # K/V头复制的次数
         self.head_dim = args.hidden_size // args.num_attention_heads # 每个头的维度 
 
         # 投影层
@@ -244,8 +244,8 @@ class Attention(nn.Module):
 
         # 把输入拆分成多个头 用view
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
 
         # 对于Q和K使用RoPE
         cos, sin = position_embeddings
@@ -255,8 +255,8 @@ class Attention(nn.Module):
         # 拼接是在 seq_len 维度操作的，而广播是在 heads 维度操作的
         # 拼接的意义是当前 Q 可以看到历史所有 token
         if past_key_value is not None:
-            torch.cat([past_key_value[0], xk], dim = 1)
-            torch.cat([past_key_value[1], xv], dim = 1)
+            xk = torch.cat([past_key_value[0], xk], dim = 1)
+            xv = torch.cat([past_key_value[1], xv], dim = 1)
         past_kv = (xk, xv) if use_cache else None
 
         xq, xk, xv = (
@@ -277,9 +277,9 @@ class Attention(nn.Module):
             # 这个是后两个维度的矩阵乘法，得到每个头的注意力分数 维度为 [bsz, n_local_heads, seq_len, seq_len]
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
             # 注意力掩码
-            # 对角线以下变成负无穷 这样经过softmax后就变成0了
+            # 对角线以上变成负无穷 这样经过softmax后就变成0了
             # 维度变为 [1, 1, seq_len, seq_len]才能和scores广播相加
-            scores = scores + torch.tril((torch.full((seq_len, seq_len), float("-inf"), device = scores.device)), diagonal = 1).unsqueeze(0).unsqueeze(0)
+            scores = scores + torch.triu((torch.full((seq_len, seq_len), float("-inf"), device = scores.device)), diagonal = 1).unsqueeze(0).unsqueeze(0)
 
             if attention_mask is not None:
                 # [bsz, 1, 1, seq_len]
@@ -289,7 +289,8 @@ class Attention(nn.Module):
                 scores = scores + extended_attention_mask
         
             scores = F.softmax(scores.float(), dim = -1).type_as(scores)
-            scores = self.attn_dropout(scores)
+            # attention中的dropout
+            scores = self.dropout(scores)
             output = scores @ xv
 
         # 最后拼接头，输出投影，返回
@@ -330,7 +331,7 @@ class MokioMindBlock(nn.Module):
         
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
-        self.head.dim = self.hidden_size // self.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_attention_heads
         self.self_attn = Attention(config)
         
         self.layer_id = layer_id
@@ -462,7 +463,7 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         
         # 隐藏层映射回词表 表示每个词的概率
         self.lm_head = nn.Linear(
-            self.config.hidden_size, self.vocab_size, bias=False
+            self.config.hidden_size, self.config.vocab_size, bias=False
         )
         
         # 权重共享
@@ -472,10 +473,12 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         
 
         
-    def forward(self, input_ids:Optional[torch.Tensor] = None,
+    def forward(self, 
+                input_ids:Optional[torch.Tensor] = None,
                 attention_mask:Optional[torch.Tensor] = None,
                 past_key_values:Optional[Tuple[Tuple[torch.Tensor]]] = None,
                 use_cache:bool = False,
+                labels: Optional[torch.Tensor] = None,
                 logits_to_keep:Union[int, torch.Tensor] = 0,
                 **args):
         hidden_states, past_key_values = self.model(
@@ -495,7 +498,19 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         )
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         
+        
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+        
         return CausalLMOutputWithPast(
+            loss=loss,
             logits=logits,
             past_key_values=past_key_values,
             hidden_states=hidden_states,

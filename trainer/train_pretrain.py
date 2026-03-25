@@ -15,7 +15,7 @@ from torch import optim  # 优化器
 from torch.nn.parallel import DistributedDataParallel  # 分布式数据并行
 from torch.utils.data import DataLoader, DistributedSampler  # 数据加载器
 
-from model.model import MokioMindConfig
+from model.MokioModel import MokioMindConfig
 from dataset.lm_dataset import PretrainDataset
 from trainer.trainer_utils import (  # 训练工具函数
     get_lr,
@@ -54,7 +54,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         
         # 动态学习率
         # 计算当前学习率
-        lr = get_lr(epoch*iters + step, args.epoch*iters, args.learning_rate)
+        lr = get_lr(epoch*iters + step, args.epochs*iters, args.learning_rate)
         
         # optimizer负载当前模型所有带训练参数
         # 每个batch都要调整所有的parameters
@@ -68,14 +68,14 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             # 向前传播
             res = model(input_ids = input_ids, attention_mask = attention_mask, labels = labels)
             # 计算loss
-            loss = res.loss + res.aux_loss
+            loss = res.loss
             loss = loss / args.accumulation_steps # 平均化损失，适应梯度累积
             
         # 反向传播
         # 先放大
         scaler.scale(loss).backward()
         # 梯度累计
-        if (step + 1) % args.accumulation_step == 0:
+        if (step + 1) % args.accumulation_steps == 0:
             # 再缩小回去
             scaler.unscale_(optimizer)
             # 梯度裁剪
@@ -191,7 +191,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_path",
         type=str,
-        default="../dataset/pretrain_hq.jsonl",  # ！修正：原"dataset/..."缺少../前缀
+        default="D:\Code\Minimind\dataset\pretrain_hq.json",
         help="预训练数据路径",
     )
     parser.add_argument(

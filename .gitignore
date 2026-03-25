@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# Local training data (do not commit)
+dataset/pretrain_hq.json
+dataset/pretrain_hq.jsonl
